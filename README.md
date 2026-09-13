@@ -69,6 +69,20 @@ reference photos, [GPT Image 2](https://www.kavel.ai/image/gpt-image-2?utm_sourc
 that is spelled correctly, and [Seedream 5.0 Pro](https://www.kavel.ai/image/seedream-5-pro?utm_source=pkggodev&utm_medium=package) for
 photoreal people and motion. [Pricing](https://www.kavel.ai/pricing?utm_source=pkggodev&utm_medium=package) lists what each tier costs.
 
+## Past the free tier: an API key
+
+When the free allowance runs out, the error tells you where to go next. Create a key at
+[kavel.ai/settings/apikeys](https://www.kavel.ai/settings/apikeys?utm_source=pkggodev&utm_medium=package) — the same account
+you use on the site — and pass it (or set `KAVEL_API_KEY`):
+
+```go
+img, err := kavel.Generate(ctx, prompt, kavel.Options{APIKey: os.Getenv("KAVEL_API_KEY"), Model: "gpt-image-2"})
+```
+
+With a key every call runs on your account, exactly as it would on the site: your
+[credits and plan](https://www.kavel.ai/pricing?utm_source=pkggodev&utm_medium=package), no per-IP ceiling, no watermark on a
+paid plan, and any image model your plan includes. `errors.Is(err, kavel.ErrAuth)` means the key is wrong; `ErrQuota` with a key means the account is out of credits.
+
 ## Writing prompts that work
 
 Name the light, the material and the composition. "A product photo of a mug" gives the model

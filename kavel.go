@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -55,7 +56,7 @@ const (
 // ErrQuota is returned when the free allowance is spent, either for this client
 // id or for this machine's daily ceiling. Signing in at https://www.kavel.ai
 // lifts the ceiling and removes the watermark.
-var ErrQuota = errors.New("kavel: free allowance spent")
+var ErrQuota = errors.New("kavel: allowance spent (create an API key at https://www.kavel.ai/settings/apikeys to keep going)")
 
 // ErrRejected is returned when the content filter refuses a prompt, or when the
 // model fails on it. Rewording clears it; retrying the same text does not.
@@ -87,7 +88,25 @@ type Options struct {
 	Timeout time.Duration
 	// HTTPClient is used for every request. Nil means http.DefaultClient.
 	HTTPClient *http.Client
+	// APIKey is a key from https://www.kavel.ai/settings/apikeys. With a key the
+	// call runs on your account: your credits, your plan's models, and no
+	// watermark on a paid plan. Empty means the KAVEL_API_KEY environment
+	// variable, and if that is unset too, the free anonymous tier.
+	APIKey string
+	// Model overrides the engine. Only honoured with an API key; the free tier
+	// has one model per lane.
+	Model string
 }
+
+func (o Options) key() string {
+	if o.APIKey != "" {
+		return o.APIKey
+	}
+	return os.Getenv("KAVEL_API_KEY")
+}
+
+// ErrAuth is returned when the API key is invalid or has been deleted.
+var ErrAuth = errors.New("kavel: invalid API key")
 
 type envelope struct {
 	Code    int             `json:"code"`
@@ -106,6 +125,7 @@ type queryData struct {
 	Images      []string `json:"images"`
 	Watermarked []bool   `json:"watermarked"`
 	Queued      bool     `json:"queued"`
+	CleanImages []string `json:"cleanImages"`
 }
 
 func anonID() string {
@@ -133,7 +153,7 @@ func Generate(ctx context.Context, prompt string, opts Options) (Image, error) {
 	return run(ctx, opts, map[string]any{
 		"provider":  "kie",
 		"mediaType": "image",
-		"model":     ModelGenerate,
+		"model":     pick(opts, ModelGenerate),
 		"scene":     "text-to-image",
 		"prompt":    prompt,
 		"options":   map[string]any{"aspect_ratio": ratio},
@@ -157,11 +177,18 @@ func Edit(ctx context.Context, sourceURL, instruction string, opts Options) (Ima
 	return run(ctx, opts, map[string]any{
 		"provider":  "kie",
 		"mediaType": "image",
-		"model":     ModelEdit,
+		"model":     pick(opts, ModelEdit),
 		"scene":     "image-to-image",
 		"prompt":    instruction,
 		"options":   map[string]any{"image_input": []string{sourceURL}},
 	})
+}
+
+func pick(opts Options, free string) string {
+	if opts.key() != "" && opts.Model != "" {
+		return opts.Model
+	}
+	return free
 }
 
 func run(ctx context.Context, opts Options, payload map[string]any) (Image, error) {
@@ -181,9 +208,18 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// A fresh identity per call: the grant pays for one edit or three images, so
-	// a reused id walls partway through a loop for reasons the caller cannot see.
+	// With a key the account is the identity. Without one, a fresh anonymous id
+	// per call: the grant pays for one edit or three images, so a reused id walls
+	// partway through a loop for reasons the caller cannot see.
+	key := opts.key()
 	id := anonID()
+	authorize := func(r *http.Request) {
+		if key != "" {
+			r.Header.Set("Authorization", "Bearer "+key)
+		} else {
+			r.Header.Set("x-anon-id", id)
+		}
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -194,7 +230,7 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 		return Image{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-anon-id", id)
+	authorize(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -209,10 +245,7 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 	// Refusals answer HTTP 200 with code -1 and a human message; only the
 	// message distinguishes "sign in for this" from an argument mistake.
 	if env.Code != 0 {
-		if strings.Contains(strings.ToLower(env.Message), "sign in") {
-			return Image{}, fmt.Errorf("%w: %s", ErrSignIn, env.Message)
-		}
-		return Image{}, fmt.Errorf("kavel: %s", env.Message)
+		return Image{}, classify(env.Message)
 	}
 
 	var submitted submitData
@@ -238,6 +271,9 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 	// poll that crosses the end of it, so polling is not merely how the result
 	// is read — it is what starts the work.
 	query := fmt.Sprintf("%s/api/ai/anon-query?taskId=%s&provider=kie&mediaType=image", BaseURL, submitted.ID)
+	if key != "" {
+		query = BaseURL + "/api/ai/query"
+	}
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	var lastErr error
@@ -251,7 +287,7 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 		case <-ticker.C:
 		}
 
-		polled, err := pollOnce(ctx, client, query, id)
+		polled, err := pollOnce(ctx, client, query, submitted.ID, key != "", authorize)
 		if err != nil {
 			// A dropped connection mid-queue is not a failed generation, and
 			// giving up on one would abandon a job that is about to be paid
@@ -261,6 +297,9 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 		}
 		lastErr = nil
 
+		if len(polled.CleanImages) > 0 {
+			return Image{URL: polled.CleanImages[0]}, nil
+		}
 		if len(polled.Images) > 0 {
 			img := Image{URL: polled.Images[0]}
 			if len(polled.Watermarked) > 0 {
@@ -274,12 +313,22 @@ func run(ctx context.Context, opts Options, payload map[string]any) (Image, erro
 	}
 }
 
-func pollOnce(ctx context.Context, client *http.Client, query, id string) (queryData, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, query, nil)
+func pollOnce(ctx context.Context, client *http.Client, query, task string, keyed bool, authorize func(*http.Request)) (queryData, error) {
+	var req *http.Request
+	var err error
+	if keyed {
+		body, _ := json.Marshal(map[string]string{"taskId": task})
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, query, bytes.NewReader(body))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	} else {
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, query, nil)
+	}
 	if err != nil {
 		return queryData{}, err
 	}
-	req.Header.Set("x-anon-id", id)
+	authorize(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return queryData{}, err
@@ -298,6 +347,20 @@ func pollOnce(ctx context.Context, client *http.Client, query, id string) (query
 		return queryData{}, err
 	}
 	return polled, nil
+}
+
+// classify turns a refusal message into the sentinel a caller can branch on.
+func classify(msg string) error {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "invalid api key"):
+		return fmt.Errorf("%w: %s", ErrAuth, msg)
+	case strings.Contains(lower, "insufficient credits"):
+		return fmt.Errorf("%w: %s", ErrQuota, msg)
+	case strings.Contains(lower, "sign in"), strings.Contains(lower, "subscription"):
+		return fmt.Errorf("%w: %s", ErrSignIn, msg)
+	}
+	return fmt.Errorf("kavel: %s", msg)
 }
 
 // Credits reports what the current machine and a given client id have left. It

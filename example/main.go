@@ -19,6 +19,7 @@ import (
 func main() {
 	edit := flag.String("edit", "", "url of an image to edit instead of generating a new one")
 	ratio := flag.String("ratio", "1:1", `aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4`)
+	model := flag.String("model", "", "engine override, used only with an API key (KAVEL_API_KEY)")
 	flag.Parse()
 
 	prompt := strings.Join(flag.Args(), " ")
@@ -28,7 +29,8 @@ func main() {
 	}
 
 	ctx := context.Background()
-	opts := kavel.Options{AspectRatio: *ratio}
+	// An API key is read from KAVEL_API_KEY by the package itself.
+	opts := kavel.Options{AspectRatio: *ratio, Model: *model}
 
 	var (
 		img kavel.Image

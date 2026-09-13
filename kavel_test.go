@@ -2,7 +2,9 @@ package kavel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,4 +151,49 @@ func postFor(t *testing.T, srv *httptest.Server) (Image, error) {
 	t.Helper()
 	defer swapBase(srv.URL)()
 	return Generate(context.Background(), "a mug", Options{PollEvery: time.Millisecond, Timeout: time.Second})
+}
+
+func TestAPIKeyAuthenticatesAndPollsTheAccountQuery(t *testing.T) {
+	var submitAuth, pollAuth, pollBody, model string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/api/ai/generate":
+			submitAuth = r.Header.Get("Authorization")
+			var p map[string]any
+			json.Unmarshal(body, &p)
+			model, _ = p["model"].(string)
+			w.Write([]byte(`{"code":0,"message":"ok","data":{"id":"row1"}}`))
+		case "/api/ai/query":
+			pollAuth, pollBody = r.Header.Get("Authorization"), string(body)
+			w.Write([]byte(`{"code":0,"message":"ok","data":{"status":"success","images":["https://cdn/marked.webp"],"watermarked":[true],"cleanImages":["https://cdn/clean.webp"]}}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	defer swapBase(srv.URL)()
+
+	img, err := Generate(context.Background(), "a mug", Options{APIKey: "sk-abc", Model: "gpt-image-2", PollEvery: 10 * time.Millisecond, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.URL != "https://cdn/clean.webp" || img.Watermarked {
+		t.Fatalf("got %+v, want the clean image", img)
+	}
+	if submitAuth != "Bearer sk-abc" || pollAuth != "Bearer sk-abc" {
+		t.Fatalf("auth headers %q / %q", submitAuth, pollAuth)
+	}
+	if pollBody != `{"taskId":"row1"}` || model != "gpt-image-2" {
+		t.Fatalf("poll body %q, model %q", pollBody, model)
+	}
+}
+
+func TestInvalidKeyAndInsufficientCredits(t *testing.T) {
+	if !errors.Is(classify("invalid API key — create one"), ErrAuth) {
+		t.Fatal("invalid key should be ErrAuth")
+	}
+	if !errors.Is(classify("insufficient credits"), ErrQuota) {
+		t.Fatal("insufficient credits should be ErrQuota")
+	}
 }
